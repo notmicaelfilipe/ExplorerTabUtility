@@ -226,8 +226,8 @@ jobs:
           draft: true
           body: |
             ${{ steps.generate_changelog.outputs.changelog }}
-            
+
             **Note:** If you are not sure, then you probably want: [${{ env.PROJECT_NAME }}_${{ env.VERSION }}_Setup.exe](https://github.com/${{ github.repository }}/releases/download/${{ env.VERSION }}/${{ env.PROJECT_NAME }}_${{ env.VERSION }}_Setup.exe)
           files: |
-            release-artifacts/*.zip
-            release-artifacts/*.exe
+            ./artifacts/*.zip
+            ./artifacts/*.exe
