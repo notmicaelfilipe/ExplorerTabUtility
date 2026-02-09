@@ -183,14 +183,14 @@ jobs:
       - name: Download Signed Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: signed-artifacts
-          path: release-artifacts
+          path: ./artifacts
+          merge-multiple: true
 
       - name: Download Signed Installer
         uses: actions/download-artifact@v4
         with:
-          name: signed-installer
-          path: release-artifacts
+          path: ./artifacts
+          merge-multiple: true
 
       - name: Generate Changelog
         id: generate_changelog
