@@ -223,7 +223,6 @@ jobs:
         with:
           tag_name: ${{ env.VERSION }}
           name: ${{ env.PROJECT_NAME }} ${{ env.VERSION }}
-          draft: true
           body: |
             ${{ steps.generate_changelog.outputs.changelog }}
 
