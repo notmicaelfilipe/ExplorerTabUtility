@@ -12,6 +12,7 @@ public class WindowRecord(string location, nint handle = 0, string[]? selectedIt
     public string Location { get; set; } = location;
     public string[]? SelectedItems { get; set; } = selectedItems;
     public long CreatedAt { get; set; } = Environment.TickCount;
+    public int Order { get; set; }
     public bool Restore { get; set; } = restore;
 
     [JsonIgnore] public string DisplayLocation => Uri.UnescapeDataString(Location.Replace(@"file:\\\", ""));

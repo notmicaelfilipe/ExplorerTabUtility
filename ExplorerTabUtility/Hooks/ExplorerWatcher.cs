@@ -477,8 +477,12 @@ public class ExplorerWatcher : IHook
         if (SettingsManager.RestorePreviousWindows)
             windowInfo.OnNavigateHandler = (object _, ref object _) =>
             {
-                windowInfo.Location = GetLocation(window);
-                windowInfo.Name = window.LocationName;
+                try
+                {
+                    windowInfo.Location = GetLocation(window);
+                    windowInfo.Name = window.LocationName;
+                }
+                catch { /* COM object may be in a bad state during navigation */ }
             };
 
         try
@@ -528,13 +532,13 @@ public class ExplorerWatcher : IHook
             MessageBoxButton.YesNo,
             MessageBoxImage.Question));
 
-        foreach (var record in _closedWindows.Where(record => record.Restore))
+        foreach (var record in _closedWindows.Where(record => record.Restore).OrderBy(r => r.Order))
         {
             record.Restore = false;
-            
+
             if (result != MessageBoxResult.Yes) continue;
-            
-            _ = OpenTabNavigateWithSelection(record);
+
+            await OpenTabNavigateWithSelection(record);
         }
     }
     private async Task OpenNewWindowWithSelection(WindowRecord windowToOpen, bool duplicate = true, bool lockToOpenWindows = true)
@@ -870,13 +874,13 @@ public class ExplorerWatcher : IHook
                 }
                 catch
                 {
-                    if (info.OnNavigateHandler != null)
+                    if (info.OnNavigateHandler != null && !string.IsNullOrEmpty(info.Location))
                     {
                         crashCount++;
                         lock (_closedWindowsLock)
-                            _closedWindows.Add(new WindowRecord(info.Location!, name: info.Name!));
+                            _closedWindows.Add(new WindowRecord(info.Location!, name: info.Name ?? string.Empty) { Order = info.Order });
                     }
-                    
+
                     RemoveWindowAndUnhookEvents(window, info, useLock: false);
                 }
             }
@@ -977,19 +981,44 @@ public class ExplorerWatcher : IHook
         if (SettingsManager.RestorePreviousWindows)
             lock (_windowEntryDictLock)
             {
-                store.AddRange(_windowEntryDict.Values
-                    .Where(w => w.OnNavigateHandler != null)
-                    .Select(w => new WindowRecord(w.Location!, name: w.Name!, restore: true)));
+                // Build tab-handle → WindowInfo mapping for trackable windows
+                var trackable = new Dictionary<nint, WindowInfo>();
+                for (var i = 0; i < _windowEntryDict.Count; i++)
+                {
+                    var (_, info, tabHandle) = _windowEntryDict.ElementAt<WindowEntry>(i);
+                    if (info.OnNavigateHandler == null || string.IsNullOrEmpty(info.Location)) continue;
+                    if (tabHandle is > 0)
+                        trackable[tabHandle.Value] = info;
+                }
+
+                var order = 0;
+                var ordered = new HashSet<WindowInfo>();
+
+                // Try to determine actual visual tab order from live windows
+                try
+                {
+                    foreach (var windowHandle in Helper.GetAllExplorerWindows())
+                    {
+                        foreach (var tabHandle in Helper.GetAllExplorerTabs(windowHandle))
+                        {
+                            if (!trackable.TryGetValue(tabHandle, out var info)) continue;
+                            if (!ordered.Add(info)) continue;
+                            store.Add(new WindowRecord(info.Location!, name: info.Name!, restore: true) { Order = order++ });
+                        }
+                    }
+                }
+                catch { /* Windows may be dead during crash; fall back below */ }
+
+                // Add any remaining windows not found via tab enumeration (crash path fallback)
+                foreach (var info in trackable.Values.Where(w => !ordered.Contains(w)).OrderBy(w => w.Order))
+                {
+                    store.Add(new WindowRecord(info.Location!, name: info.Name!, restore: true) { Order = order++ });
+                }
             }
-        
-        // DistinctBy location
-        var distinctItems = store
-            .GroupBy(w => w.Location)
-            .Select(g => g.Last())
-            .ToArray();
-        
+
         // TakeLast 100
-        SettingsManager.ClosedWindows = distinctItems.Skip(Math.Max(0, distinctItems.Length - 100)).ToArray();
+        var count = store.Count;
+        SettingsManager.ClosedWindows = store.Skip(Math.Max(0, count - 100)).ToArray();
     }
 
     public void Dispose()
