@@ -421,7 +421,8 @@ public class ExplorerWatcher : IHook
             {
                 showAgain = false;
 
-                _ = OpenTabNavigateWithSelection(new WindowRecord(location, hWnd, GetSelectedItems(window)), _mainWindowHandle);
+                var selectedItems = GetSelectedItems(window) ?? await Helper.DoUntilNotDefaultAsync(() => GetSelectedItems(window), 500, 50);
+                _ = OpenTabNavigateWithSelection(new WindowRecord(location, hWnd, selectedItems), _mainWindowHandle);
 
                 window.Quit();
                 RemoveWindowAndUnhookEvents(window, windowInfo);
@@ -640,6 +641,11 @@ public class ExplorerWatcher : IHook
                 {
                     windowHandle = WinApi.GetParent(existingTab);
                     await SelectTabByHandle(windowHandle, existingTab);
+
+                    var existingWindow = GetWindowByTabHandle(existingTab);
+                    if (existingWindow != null)
+                        SelectItems(existingWindow, windowToOpen.SelectedItems);
+
                     WinApi.RestoreWindowToForeground(windowHandle);
                     return;
                 }
