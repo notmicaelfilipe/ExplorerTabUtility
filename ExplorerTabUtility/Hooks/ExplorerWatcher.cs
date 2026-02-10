@@ -546,7 +546,9 @@ public class ExplorerWatcher : IHook
                 isFirstTab = false;
 
                 var activeTabHandle = GetActiveTabHandle(_mainWindowHandle);
-                var window = activeTabHandle != 0 ? GetWindowByTabHandle(activeTabHandle) : null;
+                var window = activeTabHandle != 0
+                    ? await Helper.DoUntilNotDefaultAsync(() => GetWindowByTabHandle(activeTabHandle), 2_000, 50)
+                    : null;
 
                 if (window != null)
                 {
@@ -1042,7 +1044,19 @@ public class ExplorerWatcher : IHook
                 {
                     foreach (var windowHandle in Helper.GetAllExplorerWindows())
                     {
-                        foreach (var tabHandle in Helper.GetAllExplorerTabs(windowHandle))
+                        // Sort tabs by screen position (Left) to get visual left-to-right order
+                        // FindWindowEx returns Z-order where active tab is first, not visual order
+                        var tabs = Helper.GetAllExplorerTabs(windowHandle)
+                            .Where(t => trackable.ContainsKey(t))
+                            .Select(t =>
+                            {
+                                WinApi.GetWindowRect(t, out var rect);
+                                return (handle: t, rect.Left);
+                            })
+                            .OrderBy(t => t.Left)
+                            .ToList();
+
+                        foreach (var (tabHandle, _) in tabs)
                         {
                             if (!trackable.TryGetValue(tabHandle, out var info)) continue;
                             if (!ordered.Add(info)) continue;
