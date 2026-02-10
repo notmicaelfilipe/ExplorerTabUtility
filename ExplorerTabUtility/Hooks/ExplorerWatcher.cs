@@ -532,11 +532,48 @@ public class ExplorerWatcher : IHook
             MessageBoxButton.YesNo,
             MessageBoxImage.Question));
 
+        var isFirstTab = true;
         foreach (var record in _closedWindows.Where(record => record.Restore).OrderBy(r => r.Order))
         {
             record.Restore = false;
 
             if (result != MessageBoxResult.Yes) continue;
+
+            // Navigate the existing default tab instead of creating a new one
+            if (isFirstTab)
+            {
+                isFirstTab = false;
+
+                var activeTabHandle = GetActiveTabHandle(_mainWindowHandle);
+                var window = activeTabHandle != 0 ? GetWindowByTabHandle(activeTabHandle) : null;
+
+                if (window != null)
+                {
+                    var tcs = new TaskCompletionSource<bool>();
+                    DWebBrowserEvents2_NavigateComplete2EventHandler navigateHandler = null!;
+                    navigateHandler = (object _, ref object _) =>
+                    {
+                        window.NavigateComplete2 -= navigateHandler;
+                        tcs.TrySetResult(true);
+                        SelectItems(window, record.SelectedItems);
+                    };
+
+                    window.NavigateComplete2 += navigateHandler;
+                    try
+                    {
+                        await Navigate(window, record.Location);
+                    }
+                    catch
+                    {
+                        window.NavigateComplete2 -= navigateHandler;
+                        tcs.TrySetResult(false);
+                    }
+
+                    WinApi.RestoreWindowToForeground(_mainWindowHandle);
+                    await Task.WhenAny(tcs.Task, Task.Delay(5000));
+                    continue;
+                }
+            }
 
             await OpenTabNavigateWithSelection(record);
         }
