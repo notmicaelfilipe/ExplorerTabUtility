@@ -1024,6 +1024,50 @@ public class ExplorerWatcher : IHook
 
         // Save currently open windows (explorer crash / system restart, logoff / AppExit)
         if (SettingsManager.RestorePreviousWindows)
+        {
+            // Determine visual tab order BEFORE acquiring the dict lock.
+            // ShellTabWindowClass windows all share the same screen rect (overlapping content panels),
+            // so GetWindowRect.Left cannot distinguish them. Instead, select each tab by its visual
+            // index and observe which handle becomes the Z-order first (active) tab.
+            var visualOrder = new Dictionary<nint, int>();
+            try
+            {
+                var globalOrder = 0;
+                foreach (var windowHandle in Helper.GetAllExplorerWindows())
+                {
+                    var tabs = Helper.GetAllExplorerTabs(windowHandle).ToList();
+                    if (tabs.Count == 0) continue;
+
+                    if (tabs.Count == 1)
+                    {
+                        visualOrder[tabs[0]] = globalOrder++;
+                        continue;
+                    }
+
+                    nint previousActive = 0;
+                    for (var i = 0; i < tabs.Count; i++)
+                    {
+                        SelectTabByIndex(windowHandle, i);
+
+                        // Poll until a different tab becomes Z-order first (max ~200ms per tab)
+                        nint activeTab = 0;
+                        for (var attempt = 0; attempt < 20; attempt++)
+                        {
+                            activeTab = WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null);
+                            if (activeTab != 0 && activeTab != previousActive) break;
+                            Thread.Sleep(10);
+                        }
+
+                        if (activeTab != 0)
+                        {
+                            visualOrder[activeTab] = globalOrder++;
+                            previousActive = activeTab;
+                        }
+                    }
+                }
+            }
+            catch { /* Windows may be dead during crash; visual order unavailable */ }
+
             lock (_windowEntryDictLock)
             {
                 // Build tab-handle → WindowInfo mapping for trackable windows
@@ -1037,41 +1081,15 @@ public class ExplorerWatcher : IHook
                 }
 
                 var order = 0;
-                var ordered = new HashSet<WindowInfo>();
-
-                // Try to determine actual visual tab order from live windows
-                try
+                // Use visual order when available, fall back to creation order
+                foreach (var kv in trackable
+                             .OrderBy(kv => visualOrder.TryGetValue(kv.Key, out var idx) ? idx : int.MaxValue)
+                             .ThenBy(kv => kv.Value.Order))
                 {
-                    foreach (var windowHandle in Helper.GetAllExplorerWindows())
-                    {
-                        // Sort tabs by screen position (Left) to get visual left-to-right order
-                        // FindWindowEx returns Z-order where active tab is first, not visual order
-                        var tabs = Helper.GetAllExplorerTabs(windowHandle)
-                            .Where(t => trackable.ContainsKey(t))
-                            .Select(t =>
-                            {
-                                WinApi.GetWindowRect(t, out var rect);
-                                return (handle: t, rect.Left);
-                            })
-                            .OrderBy(t => t.Left)
-                            .ToList();
-
-                        foreach (var (tabHandle, _) in tabs)
-                        {
-                            if (!trackable.TryGetValue(tabHandle, out var info)) continue;
-                            if (!ordered.Add(info)) continue;
-                            store.Add(new WindowRecord(info.Location!, name: info.Name!, restore: true) { Order = order++ });
-                        }
-                    }
-                }
-                catch { /* Windows may be dead during crash; fall back below */ }
-
-                // Add any remaining windows not found via tab enumeration (crash path fallback)
-                foreach (var info in trackable.Values.Where(w => !ordered.Contains(w)).OrderBy(w => w.Order))
-                {
-                    store.Add(new WindowRecord(info.Location!, name: info.Name!, restore: true) { Order = order++ });
+                    store.Add(new WindowRecord(kv.Value.Location!, name: kv.Value.Name!, restore: true) { Order = order++ });
                 }
             }
+        }
 
         // TakeLast 100
         var count = store.Count;
