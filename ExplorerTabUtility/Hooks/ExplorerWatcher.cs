@@ -534,11 +534,15 @@ public class ExplorerWatcher : IHook
             MessageBoxImage.Question));
 
         var isFirstTab = true;
+        nint firstTabHandle = 0;
+        var tabCount = 0;
         foreach (var record in _closedWindows.Where(record => record.Restore).OrderBy(r => r.Order))
         {
             record.Restore = false;
 
             if (result != MessageBoxResult.Yes) continue;
+
+            tabCount++;
 
             // Navigate the existing default tab instead of creating a new one
             if (isFirstTab)
@@ -546,6 +550,7 @@ public class ExplorerWatcher : IHook
                 isFirstTab = false;
 
                 var activeTabHandle = GetActiveTabHandle(_mainWindowHandle);
+                firstTabHandle = activeTabHandle;
                 var window = activeTabHandle != 0
                     ? await Helper.DoUntilNotDefaultAsync(() => GetWindowByTabHandle(activeTabHandle), 2_000, 50)
                     : null;
@@ -580,6 +585,10 @@ public class ExplorerWatcher : IHook
 
             await OpenTabNavigateWithSelection(record);
         }
+
+        // Focus the first restored tab
+        if (firstTabHandle != 0 && tabCount > 1)
+            await SelectTabByHandle(_mainWindowHandle, firstTabHandle);
     }
     private async Task OpenNewWindowWithSelection(WindowRecord windowToOpen, bool duplicate = true, bool lockToOpenWindows = true)
     {
