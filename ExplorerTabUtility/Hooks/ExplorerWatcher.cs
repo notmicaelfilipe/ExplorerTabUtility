@@ -826,7 +826,11 @@ public class ExplorerWatcher : IHook
             var name = names[i];
             object item = document.Folder.ParseName(name);
             if (item == null) continue;
-            document.SelectItem(ref item, 1);
+
+            // First item: SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_ENSUREVISIBLE | SVSI_FOCUSED
+            // Other items: SVSI_SELECT only
+            var flags = i == 0 ? 0x1 | 0x4 | 0x8 | 0x10 : 0x1;
+            document.SelectItem(ref item, flags);
         }
     }
     private static string GetLocation(InternetExplorer window)
