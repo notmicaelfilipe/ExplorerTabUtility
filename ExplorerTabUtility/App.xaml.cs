@@ -17,6 +17,7 @@ public partial class App : Application
 
         if (createdNew)
         {
+            Log.Write($"--- Startup v{typeof(App).Assembly.GetName().Version} ---");
             base.OnStartup(e);
             SetupTooltipBehavior();
 
@@ -33,6 +34,7 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        Log.Write($"--- Exit (code {e.ApplicationExitCode}) ---");
         _mutex?.Dispose();
         base.OnExit(e);
     }

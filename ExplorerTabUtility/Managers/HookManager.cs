@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Drawing;
 using System.Threading;
 using System.Threading.Tasks;
@@ -35,7 +35,11 @@ public sealed class HookManager
         _keyboardHook.OnHotKeyProfileTriggered += OnHotKeyProfileTriggered;
         _mouseHook.OnHotKeyProfileTriggered += OnHotKeyProfileTriggered;
         _windowHook.OnShellInitialized += () => OnShellInitialized?.Invoke();
-        System.Windows.Application.Current.SessionEnding += (_, _) => Dispose();
+        System.Windows.Application.Current.SessionEnding += (_, e) =>
+        {
+            Log.Write($"SessionEnding: {e.ReasonSessionEnding}");
+            Dispose();
+        };
     }
 
     public void StartMouseHook() => ChangeHookStatus(_mouseHook, true);
@@ -199,6 +203,7 @@ public sealed class HookManager
 
     public void Dispose()
     {
+        Log.Write("HookManager.Dispose");
         _keyboardHook.Dispose();
         _mouseHook.Dispose();
         _windowHook.Dispose();

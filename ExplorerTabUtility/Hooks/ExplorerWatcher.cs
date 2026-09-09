@@ -36,6 +36,7 @@ public class ExplorerWatcher : IHook
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1);
     private readonly ProcessWatcher _processWatcher;
     private int _mainExplorerProcessId;
+    private int _shellObjectsInitialized;
     private Timer? _explorerCheckTimer;
 
     private nint _eventObjectShowHookId;
@@ -527,11 +528,15 @@ public class ExplorerWatcher : IHook
 
     private async Task RestorePreviousWindows()
     {
+        Log.Write($"RestorePreviousWindows: prompting for {_closedWindows.Count(r => r.Restore)} window(s)");
+
         var result = await RunInStaThread(() => CustomMessageBox.Show(
             "Do you want to restore previously opened windows?",
             "Explorer Tab Utility",
             MessageBoxButton.YesNo,
             MessageBoxImage.Question));
+
+        Log.Write($"RestorePreviousWindows: user answered {result}");
 
         var isFirstTab = true;
         nint firstTabHandle = 0;
@@ -585,6 +590,8 @@ public class ExplorerWatcher : IHook
 
             await OpenTabNavigateWithSelection(record);
         }
+
+        Log.Write($"RestorePreviousWindows: restored {tabCount} window(s)");
 
         // Focus the first restored tab
         if (firstTabHandle != 0 && tabCount > 1)
@@ -911,6 +918,7 @@ public class ExplorerWatcher : IHook
         {
             if (e.ProcessId == _mainExplorerProcessId)
             {
+                Log.Write($"Main explorer process {e.ProcessId} terminated");
                 _mainExplorerProcessId = 0;
                 DisposeShellObjects();
                 StartExplorerProcessCheck();
@@ -942,6 +950,9 @@ public class ExplorerWatcher : IHook
                     RemoveWindowAndUnhookEvents(window, info, useLock: false);
                 }
             }
+            if (crashCount > 0)
+                Log.Write($"Explorer process {e.ProcessId} terminated: {crashCount} window(s) captured, {_windowEntryDict.Count} still tracked");
+
             if (!SettingsManager.RestorePreviousWindows || _windowEntryDict.Count > 0) return;
             lock (_closedWindowsLock)
             {
@@ -953,6 +964,9 @@ public class ExplorerWatcher : IHook
 
     private void InitializeShellObjects()
     {
+        Interlocked.Exchange(ref _shellObjectsInitialized, 1);
+        Log.Write("InitializeShellObjects: start");
+
         _shellPathComparer = new ShellPathComparer();
         _staTaskScheduler = new StaTaskScheduler();
         _shellWindows = new ShellWindows();
@@ -961,6 +975,8 @@ public class ExplorerWatcher : IHook
         
         if (SettingsManager.ClosedWindows != null)
             lock (_closedWindowsLock) _closedWindows.AddRange(SettingsManager.ClosedWindows);
+
+        Log.Write($"InitializeShellObjects: {_closedWindows.Count} record(s) in memory, {_closedWindows.Count(w => w.Restore)} flagged for restore");
 
         // Hook the global "WindowRegistered" event
         _windowRegisteredHandler = OnShellWindowRegistered;
@@ -987,12 +1003,25 @@ public class ExplorerWatcher : IHook
             HookWindowEvents(window, windowInfo);
         }
 
+        Log.Write($"InitializeShellObjects: {_windowEntryDict.Count} explorer window(s) already open");
+
         if (!hasOpen) return;
+
+        Log.Write("InitializeShellObjects: explorer windows already open, clearing all restore flags");
         lock (_closedWindowsLock)
             foreach (var window in _closedWindows) window.Restore = false;
     }
     private void DisposeShellObjects()
     {
+        // Explorer restart, SessionEnding and Application.Exit can all land here.
+        // Without this guard the second pass persists an empty state and wipes the saved windows.
+        if (Interlocked.Exchange(ref _shellObjectsInitialized, 0) == 0)
+        {
+            Log.Write("DisposeShellObjects: skipped, shell objects already disposed");
+            return;
+        }
+
+        Log.Write("DisposeShellObjects: start");
         PersistWindows();
 
         // Unhook global event
@@ -1028,10 +1057,12 @@ public class ExplorerWatcher : IHook
 
     private void PersistWindows()
     {
+        var stopwatch = Stopwatch.StartNew();
         var store = new List<WindowRecord>();
         lock (_closedWindowsLock)
         {
             if (SettingsManager.SaveClosedHistory) store.AddRange(_closedWindows);
+            Log.Write($"PersistWindows: {_closedWindows.Count} closed record(s), history={SettingsManager.SaveClosedHistory}, restorePrevious={SettingsManager.RestorePreviousWindows}, openWindows={_windowEntryDict.Count}");
             _closedWindows.Clear();
         }
 
@@ -1079,7 +1110,9 @@ public class ExplorerWatcher : IHook
                     }
                 }
             }
-            catch { /* Windows may be dead during crash; visual order unavailable */ }
+            catch (Exception ex) { Log.Write($"PersistWindows: visual order unavailable ({ex.Message})"); }
+
+            Log.Write($"PersistWindows: visual order of {visualOrder.Count} tab(s) resolved in {stopwatch.ElapsedMilliseconds}ms");
 
             lock (_windowEntryDictLock)
             {
@@ -1107,10 +1140,12 @@ public class ExplorerWatcher : IHook
         // TakeLast 100
         var count = store.Count;
         SettingsManager.ClosedWindows = store.Skip(Math.Max(0, count - 100)).ToArray();
+        Log.Write($"PersistWindows: done in {stopwatch.ElapsedMilliseconds}ms");
     }
 
     public void Dispose()
     {
+        Log.Write("ExplorerWatcher.Dispose");
         DisposeShellObjects();
         _instanceRunning = false;
         _processWatcher.Dispose();

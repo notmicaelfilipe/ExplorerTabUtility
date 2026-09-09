@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Windows;
 using System.Text.Json;
 using System.ComponentModel;
@@ -31,6 +32,9 @@ public static class SettingsManager
 
         Settings = ReadJsonFile<AppSettings>(SettingsFilePath) ?? new AppSettings();
         _closedWindows = ReadJsonFile<WindowRecord[]>(WindowsFilePath);
+
+        Log.Write($"Settings loaded: RestorePreviousWindows={Settings.RestorePreviousWindows}, SaveClosedWindows={Settings.SaveClosedWindows}");
+        Log.Write($"Loaded {_closedWindows?.Length ?? -1} window record(s) from disk ({_closedWindows?.Count(w => w.Restore) ?? 0} flagged for restore)");
 
         // One-time migration: old settings.json may contain ClosedWindows
         if (_closedWindows == null)
@@ -188,7 +192,11 @@ public static class SettingsManager
         get => _closedWindows;
         set
         {
+            if (value is not { Length: > 0 } && _closedWindows is { Length: > 0 } previous)
+                Log.Write($"WARN: overwriting {previous.Length} saved window record(s) with an empty set");
+
             _closedWindows = value;
+            Log.Write($"Persisting {value?.Length ?? -1} window record(s) ({value?.Count(w => w.Restore) ?? 0} flagged for restore)");
             SaveWindowRecords();
         }
     }
@@ -226,8 +234,9 @@ public static class SettingsManager
 
             return JsonSerializer.Deserialize<T>(json);
         }
-        catch
+        catch (Exception ex)
         {
+            Log.Write($"Failed to read {filePath}: {ex.Message}");
             return null;
         }
     }
@@ -251,7 +260,7 @@ public static class SettingsManager
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Failed to save {filePath}: {ex.Message}");
+                Log.Write($"Failed to save {filePath}: {ex}");
                 try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
             }
         }
