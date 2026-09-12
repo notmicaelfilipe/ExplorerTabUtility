@@ -29,6 +29,7 @@ public class ExplorerWatcher : IHook
     private ShellPathComparer _shellPathComparer = null!;
     private StaTaskScheduler _staTaskScheduler = null!;
     private nint _mainWindowHandle;
+    private volatile bool _isRestoring;
     private readonly ConcurrentDictionary<nint, byte> _processedHWnds = new();
     private readonly DualKeyDictionary<InternetExplorer, nint?, WindowInfo> _windowEntryDict = [];
     private readonly List<WindowRecord> _closedWindows = new();
@@ -138,6 +139,16 @@ public class ExplorerWatcher : IHook
             if (targetPidl != 0)
                 Marshal.FreeCoTaskMem(targetPidl);
         }
+    }
+    /// <summary>
+    /// Activates the window, unless we are restoring previous windows;
+    /// restore runs in the background (even minimized) without stealing focus.
+    /// </summary>
+    private void BringToForeground(nint windowHandle)
+    {
+        if (_isRestoring) return;
+
+        WinApi.RestoreWindowToForeground(windowHandle);
     }
     public async Task SelectTabByHandle(nint windowHandle, nint tabHandle)
     {
@@ -538,64 +549,71 @@ public class ExplorerWatcher : IHook
 
         Log.Write($"RestorePreviousWindows: user answered {result}");
 
-        var isFirstTab = true;
-        nint firstTabHandle = 0;
-        var tabCount = 0;
-        foreach (var record in _closedWindows.Where(record => record.Restore).OrderBy(r => r.Order))
+        _isRestoring = true;
+        try
         {
-            record.Restore = false;
-
-            if (result != MessageBoxResult.Yes) continue;
-
-            tabCount++;
-
-            // Navigate the existing default tab instead of creating a new one
-            if (isFirstTab)
+            var isFirstTab = true;
+            nint firstTabHandle = 0;
+            var tabCount = 0;
+            foreach (var record in _closedWindows.Where(record => record.Restore).OrderBy(r => r.Order))
             {
-                isFirstTab = false;
+                record.Restore = false;
 
-                var activeTabHandle = GetActiveTabHandle(_mainWindowHandle);
-                firstTabHandle = activeTabHandle;
-                var window = activeTabHandle != 0
-                    ? await Helper.DoUntilNotDefaultAsync(() => GetWindowByTabHandle(activeTabHandle), 2_000, 50)
-                    : null;
+                if (result != MessageBoxResult.Yes) continue;
 
-                if (window != null)
+                tabCount++;
+
+                // Navigate the existing default tab instead of creating a new one
+                if (isFirstTab)
                 {
-                    var tcs = new TaskCompletionSource<bool>();
-                    DWebBrowserEvents2_NavigateComplete2EventHandler navigateHandler = null!;
-                    navigateHandler = (object _, ref object _) =>
-                    {
-                        window.NavigateComplete2 -= navigateHandler;
-                        tcs.TrySetResult(true);
-                        SelectItems(window, record.SelectedItems);
-                    };
+                    isFirstTab = false;
 
-                    window.NavigateComplete2 += navigateHandler;
-                    try
-                    {
-                        await Navigate(window, record.Location);
-                    }
-                    catch
-                    {
-                        window.NavigateComplete2 -= navigateHandler;
-                        tcs.TrySetResult(false);
-                    }
+                    var activeTabHandle = GetActiveTabHandle(_mainWindowHandle);
+                    firstTabHandle = activeTabHandle;
+                    var window = activeTabHandle != 0
+                        ? await Helper.DoUntilNotDefaultAsync(() => GetWindowByTabHandle(activeTabHandle), 2_000, 50)
+                        : null;
 
-                    WinApi.RestoreWindowToForeground(_mainWindowHandle);
-                    await Task.WhenAny(tcs.Task, Task.Delay(5000));
-                    continue;
+                    if (window != null)
+                    {
+                        var tcs = new TaskCompletionSource<bool>();
+                        DWebBrowserEvents2_NavigateComplete2EventHandler navigateHandler = null!;
+                        navigateHandler = (object _, ref object _) =>
+                        {
+                            window.NavigateComplete2 -= navigateHandler;
+                            tcs.TrySetResult(true);
+                            SelectItems(window, record.SelectedItems);
+                        };
+
+                        window.NavigateComplete2 += navigateHandler;
+                        try
+                        {
+                            await Navigate(window, record.Location);
+                        }
+                        catch
+                        {
+                            window.NavigateComplete2 -= navigateHandler;
+                            tcs.TrySetResult(false);
+                        }
+
+                        await Task.WhenAny(tcs.Task, Task.Delay(5000));
+                        continue;
+                    }
                 }
+
+                await OpenTabNavigateWithSelection(record);
             }
 
-            await OpenTabNavigateWithSelection(record);
+            Log.Write($"RestorePreviousWindows: restored {tabCount} window(s)");
+
+            // Focus the first restored tab
+            if (firstTabHandle != 0 && tabCount > 1)
+                await SelectTabByHandle(_mainWindowHandle, firstTabHandle);
         }
-
-        Log.Write($"RestorePreviousWindows: restored {tabCount} window(s)");
-
-        // Focus the first restored tab
-        if (firstTabHandle != 0 && tabCount > 1)
-            await SelectTabByHandle(_mainWindowHandle, firstTabHandle);
+        finally
+        {
+            _isRestoring = false;
+        }
     }
     private async Task OpenNewWindowWithSelection(WindowRecord windowToOpen, bool duplicate = true, bool lockToOpenWindows = true)
     {
@@ -664,7 +682,7 @@ public class ExplorerWatcher : IHook
                     if (existingWindow != null)
                         SelectItems(existingWindow, windowToOpen.SelectedItems);
 
-                    WinApi.RestoreWindowToForeground(windowHandle);
+                    BringToForeground(windowHandle);
                     return;
                 }
             }
@@ -714,7 +732,7 @@ public class ExplorerWatcher : IHook
                 tcs.TrySetResult(false);
             }
 
-            WinApi.RestoreWindowToForeground(mainWindowHWnd);
+            BringToForeground(mainWindowHWnd);
 
             var timeoutTask = Task.Delay(5000);
             await Task.WhenAny(tcs.Task, timeoutTask);
