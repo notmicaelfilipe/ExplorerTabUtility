@@ -419,6 +419,7 @@ public static class Helper
         }
 
         WinApi.SetLayeredWindowAttributes(hWnd, 0, 255, WinApi.LWA_ALPHA);
+        UpdateWindowLayered(hWnd, remove: true);
         return true;
     }
 
