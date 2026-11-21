@@ -40,8 +40,8 @@ public class ExplorerWatcher : IHook
     private int _shellObjectsInitialized;
     private Timer? _explorerCheckTimer;
 
-    private nint _eventObjectShowHookId;
-    private WinEventDelegate? _eventObjectShowHookCallback;
+    private nint _eventObjectShowHookId, _eventForegroundHookId;
+    private WinEventDelegate? _winEventHookCallback;
     // Explorer windows that already had a SHOW (UI thread only); only a window's first SHOW may be hidden.
     // ponytail: never pruned until explorer restarts (one nint per window); a reused HWND just skips the early hide.
     private readonly HashSet<nint> _shownHWnds = [];
@@ -338,16 +338,30 @@ public class ExplorerWatcher : IHook
             _ = Task.Delay(7_000).ContinueWith(t => _processedHWnds.TryRemove(hWnd, out _), TaskScheduler.Default);
         }
     }
-    private void OnWindowShown(nint hWinEventHook, uint eventType, nint hWnd, int idObject, int idChild, uint dwEventThread, uint dWmsEventTime)
+    private void OnWindowEvent(nint hWinEventHook, uint eventType, nint hWnd, int idObject, int idChild, uint dwEventThread, uint dWmsEventTime)
     {
         if (idObject != 0 || idChild != 0 || !WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
 
+        if (eventType == WinApi.EVENT_SYSTEM_FOREGROUND)
+        {
+            // A new folder window gets FOREGROUND ~160ms before its SHOW, while still invisible. The out-of-context SHOW
+            // arrives once it is already on screen (a frame or the open animation shows), so hide it here already.
+            if (_isForcingTabs && !WinApi.IsWindowVisible(hWnd) && !_shownHWnds.Contains(hWnd) && !_processedHWnds.ContainsKey(hWnd))
+                HideNewWindow(hWnd);
+            return;
+        }
+
+        // SHOW: fallback for windows shown without an early FOREGROUND (Explorer's preloaded Home window)
         // A re-shown window (tiling WM, AHK, our own keep-theme show) is not new: hiding it would leave it invisible
         if (!_shownHWnds.Add(hWnd) || !_isForcingTabs) return;
 
         // Check if the hWnd was processed by OnShellWindowRegistered
         if (_processedHWnds.TryRemove(hWnd, out _)) return;
 
+        HideNewWindow(hWnd);
+    }
+    private void HideNewWindow(nint hWnd)
+    {
         // Count real windows, not COM entries: stale entries would hide every new window (upstream #133/#137)
         if (Helper.GetAnotherExplorerWindow(hWnd) == 0 || Helper.IsCtrlShiftDown()) return;
         Helper.HideWindow(hWnd, SettingsManager.HaveThemeIssue);
@@ -357,7 +371,7 @@ public class ExplorerWatcher : IHook
         _ = Task.Delay(10_000).ContinueWith(_ =>
         {
             if (!Helper.IsFileExplorerWindow(hWnd) || !Helper.ShowWindow(hWnd, removeCache: true)) return;
-            Log.Write($"OnWindowShown: window {hWnd} was never handled, showing it again");
+            Log.Write($"HideNewWindow: window {hWnd} was never handled, showing it again");
         }, TaskScheduler.Default);
     }
     private InternetExplorer? GetRecentlyCreatedWindow(out WindowInfo? windowInfo)
@@ -483,7 +497,7 @@ public class ExplorerWatcher : IHook
             {
                 await Helper.DoUntilNotDefaultAsync(() => Helper.ShowWindow(hWnd, removeCache: false), 1_500, 200);
 
-                // OnWindowShown might fire after ShellWindowRegistered and hide it again, keep the cache, wait a bit, then remove it.
+                // OnWindowEvent might fire after ShellWindowRegistered and hide it again, keep the cache, wait a bit, then remove it.
                 _ = Task.Delay(3000).ContinueWith(t => Helper.HiddenWindows.TryRemove(hWnd, out _), TaskScheduler.Default);
             }
         }
@@ -1016,11 +1030,9 @@ public class ExplorerWatcher : IHook
         _windowRegisteredHandler = OnShellWindowRegistered;
         _shellWindows.WindowRegistered += _windowRegisteredHandler;
 
-        // Hook the global "OBJECT_SHOW" event
-        SetWindowShownHook(install: true);
-
         // Hook the event handlers for already-open windows
         var hasOpen = false;
+        var trackedHWnds = new List<nint>();
         var count = _shellWindows.Count;
         for (var i = 0; i < count; i++)
         {
@@ -1031,10 +1043,14 @@ public class ExplorerWatcher : IHook
             var windowInfo = new WindowInfo();
             _windowEntryDict.Add(window, windowInfo);
             window.PutProperty("seenBefore", true);
+            trackedHWnds.Add(new IntPtr(window.HWND));
 
             _ = GetTabHandle(window);
             HookWindowEvents(window, windowInfo);
         }
+
+        // Hook the global "OBJECT_SHOW" and "SYSTEM_FOREGROUND" events
+        SetWindowEventHooks(trackedHWnds);
 
         Log.Write($"InitializeShellObjects: {_windowEntryDict.Count} explorer window(s) already open");
 
@@ -1046,23 +1062,23 @@ public class ExplorerWatcher : IHook
     }
     /// <summary>
     /// Out-of-context WinEvent callbacks only reach a thread that pumps messages, and UnhookWinEvent must run on the
-    /// installing thread. Init runs on a thread-pool timer thread (since upstream e45df24), where OnWindowShown never fired
-    /// (upstream #147), so the hook lives on the UI thread. Dispatcher queue is FIFO, so unhook/hook keep their call order.
+    /// installing thread. Init runs on a thread-pool timer thread (since upstream e45df24), where the hooks never fired
+    /// (upstream #147), so they live on the UI thread. Dispatcher queue is FIFO, so unhook/hook keep their call order.
     /// </summary>
-    private void SetWindowShownHook(bool install) => Application.Current?.Dispatcher.BeginInvoke(() =>
+    /// <param name="trackedHWnds">Windows ETU already tracks (not new), or null to uninstall.</param>
+    private void SetWindowEventHooks(IReadOnlyCollection<nint>? trackedHWnds) => Application.Current?.Dispatcher.BeginInvoke(() =>
     {
-        if (_eventObjectShowHookCallback != null)
-        {
-            WinApi.UnhookWinEvent(_eventObjectShowHookId);
-            _eventObjectShowHookCallback = null;
-        }
+        WinApi.UnhookWinEvent(_eventObjectShowHookId);
+        WinApi.UnhookWinEvent(_eventForegroundHookId);
         _shownHWnds.Clear();
-        if (!install) return;
+        if (trackedHWnds == null) return;
 
-        // Windows already open are not new
-        _shownHWnds.UnionWith(Helper.GetAllExplorerWindows());
-        _eventObjectShowHookCallback = OnWindowShown;
-        _eventObjectShowHookId = WinApi.SetWinEventHook(WinApi.EVENT_OBJECT_SHOW, WinApi.EVENT_OBJECT_SHOW, 0, _eventObjectShowHookCallback, 0, 0, 0);
+        // Only tracked windows, not every CabinetWClass: Explorer keeps a hidden preloaded window that is not
+        // registered yet, and its first SHOW (next Home/taskbar launch) must be hidden like any new window.
+        _shownHWnds.UnionWith(trackedHWnds);
+        _winEventHookCallback = OnWindowEvent;
+        _eventObjectShowHookId = WinApi.SetWinEventHook(WinApi.EVENT_OBJECT_SHOW, WinApi.EVENT_OBJECT_SHOW, 0, _winEventHookCallback, 0, 0, 0);
+        _eventForegroundHookId = WinApi.SetWinEventHook(WinApi.EVENT_SYSTEM_FOREGROUND, WinApi.EVENT_SYSTEM_FOREGROUND, 0, _winEventHookCallback, 0, 0, 0);
     });
     private void DisposeShellObjects()
     {
@@ -1083,7 +1099,7 @@ public class ExplorerWatcher : IHook
             _shellWindows.WindowRegistered -= _windowRegisteredHandler;
             _windowRegisteredHandler = null;
         }
-        SetWindowShownHook(install: false);
+        SetWindowEventHooks(null);
 
         // Unsubscribe from each InternetExplorer instance's events
         foreach (var (window, windowInfo) in _windowEntryDict)
