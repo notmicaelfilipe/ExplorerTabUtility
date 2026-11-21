@@ -42,6 +42,9 @@ public class ExplorerWatcher : IHook
 
     private nint _eventObjectShowHookId;
     private WinEventDelegate? _eventObjectShowHookCallback;
+    // Explorer windows that already had a SHOW (UI thread only); only a window's first SHOW may be hidden.
+    // ponytail: never pruned until explorer restarts (one nint per window); a reused HWND just skips the early hide.
+    private readonly HashSet<nint> _shownHWnds = [];
     private DShellWindowsEvents_WindowRegisteredEventHandler? _windowRegisteredHandler;
 
     private string _defaultLocation = null!;
@@ -337,12 +340,13 @@ public class ExplorerWatcher : IHook
     }
     private void OnWindowShown(nint hWinEventHook, uint eventType, nint hWnd, int idObject, int idChild, uint dwEventThread, uint dWmsEventTime)
     {
-        if (!_isForcingTabs || idObject != 0 || idChild != 0) return;
-        
+        if (idObject != 0 || idChild != 0 || !WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
+
+        // A re-shown window (tiling WM, AHK, our own keep-theme show) is not new: hiding it would leave it invisible
+        if (!_shownHWnds.Add(hWnd) || !_isForcingTabs) return;
+
         // Check if the hWnd was processed by OnShellWindowRegistered
         if (_processedHWnds.TryRemove(hWnd, out _)) return;
-        
-        if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
 
         // Count real windows, not COM entries: stale entries would hide every new window (upstream #133/#137)
         if (Helper.GetAnotherExplorerWindow(hWnd) == 0 || Helper.IsCtrlShiftDown()) return;
@@ -1013,8 +1017,7 @@ public class ExplorerWatcher : IHook
         _shellWindows.WindowRegistered += _windowRegisteredHandler;
 
         // Hook the global "OBJECT_SHOW" event
-        _eventObjectShowHookCallback = OnWindowShown;
-        _eventObjectShowHookId = WinApi.SetWinEventHook(WinApi.EVENT_OBJECT_SHOW, WinApi.EVENT_OBJECT_SHOW, 0, _eventObjectShowHookCallback, 0, 0, 0);
+        SetWindowShownHook(install: true);
 
         // Hook the event handlers for already-open windows
         var hasOpen = false;
@@ -1041,6 +1044,26 @@ public class ExplorerWatcher : IHook
         lock (_closedWindowsLock)
             foreach (var window in _closedWindows) window.Restore = false;
     }
+    /// <summary>
+    /// Out-of-context WinEvent callbacks only reach a thread that pumps messages, and UnhookWinEvent must run on the
+    /// installing thread. Init runs on a thread-pool timer thread (since upstream e45df24), where OnWindowShown never fired
+    /// (upstream #147), so the hook lives on the UI thread. Dispatcher queue is FIFO, so unhook/hook keep their call order.
+    /// </summary>
+    private void SetWindowShownHook(bool install) => Application.Current?.Dispatcher.BeginInvoke(() =>
+    {
+        if (_eventObjectShowHookCallback != null)
+        {
+            WinApi.UnhookWinEvent(_eventObjectShowHookId);
+            _eventObjectShowHookCallback = null;
+        }
+        _shownHWnds.Clear();
+        if (!install) return;
+
+        // Windows already open are not new
+        _shownHWnds.UnionWith(Helper.GetAllExplorerWindows());
+        _eventObjectShowHookCallback = OnWindowShown;
+        _eventObjectShowHookId = WinApi.SetWinEventHook(WinApi.EVENT_OBJECT_SHOW, WinApi.EVENT_OBJECT_SHOW, 0, _eventObjectShowHookCallback, 0, 0, 0);
+    });
     private void DisposeShellObjects()
     {
         // Explorer restart, SessionEnding and Application.Exit can all land here.
@@ -1060,11 +1083,7 @@ public class ExplorerWatcher : IHook
             _shellWindows.WindowRegistered -= _windowRegisteredHandler;
             _windowRegisteredHandler = null;
         }
-        if (_eventObjectShowHookCallback != null)
-        {
-            WinApi.UnhookWinEvent(_eventObjectShowHookId);
-            _eventObjectShowHookCallback = null;
-        }
+        SetWindowShownHook(install: false);
 
         // Unsubscribe from each InternetExplorer instance's events
         foreach (var (window, windowInfo) in _windowEntryDict)
